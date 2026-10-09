@@ -15,11 +15,11 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: ADMIN_EMAIL
-        sync: false
+        value: admin@randomchat.local
       - key: ADMIN_PASSWORD
         generateValue: true
       - key: ALLOWED_ORIGINS
-        sync: false
+        value: https://random-chat-user.onrender.com,https://random-chat-admin.onrender.com
 
   - type: web
     runtime: static
