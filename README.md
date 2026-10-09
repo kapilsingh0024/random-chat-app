@@ -97,22 +97,20 @@ VITE_API_URL=http://localhost:5000
 VITE_ADMIN_TITLE=Random Chat Admin
 ```
 
-## Production deployment
+## Production deployment on Render
 
-### Backend
-- Deploy to Render, Railway, Fly.io, or a VPS
-- Use MongoDB Atlas or an external MongoDB service
-- Set CORS to include frontend and admin domains
-- Keep JWT secret and admin credentials in environment variables
+The root `render.yaml` defines three separate Render services: the backend, user app, and admin app.
 
-### Frontend
-- Deploy user app to Vercel or Netlify
-- Deploy admin app to a different host/domain
-- Set `VITE_API_URL` to your backend URL
+1. Push the repository to GitHub, then in Render choose **New +** > **Blueprint** and select this repository. Render reads `render.yaml` from the repository root.
+2. Create a MongoDB Atlas database and database user. Set its network access to allow Render connections; Render's outbound IPs may change. Copy the Atlas connection string and replace its username and password with the database user's credentials.
+3. In the backend service's Environment settings, set `MONGODB_URI`, a strong unique `ADMIN_PASSWORD`, `ADMIN_EMAIL`, and `ALLOWED_ORIGINS`. Use the two frontend origins separated by a comma, for example `https://random-chat-user.onrender.com,https://random-chat-admin.onrender.com`. Keep the generated `JWT_SECRET` private. Save the changes and deploy the backend.
+4. Wait for the backend's `/health` endpoint to return `{"status":"ok"}`. Copy its `https://...onrender.com` URL.
+5. In both static services, set `VITE_API_URL` to that complete backend URL, including `https://`. Save and redeploy each frontend; Vite embeds this value during the build.
+6. Confirm the admin service's URL is included in the backend's `ALLOWED_ORIGINS` value, and update/redeploy the backend if either frontend URL changes.
 
-### TURN server
-- Host coturn or a managed TURN service
-- Add the TURN credentials to the user app environment as shown above
+The admin login uses the `ADMIN_EMAIL` and `ADMIN_PASSWORD` values configured for the backend. Do not use the example local credentials in production. Audio/video calling may also need a TURN service for users behind restrictive networks; STUN alone is not sufficient for every network.
+
+If a MongoDB URI or password was ever committed to Git or shared, rotate that database user's password before deployment. Never put production credentials in `.env.example` or commit a `.env` file.
 
 ## Privacy and moderation
 
