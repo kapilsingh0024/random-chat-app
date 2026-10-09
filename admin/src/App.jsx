@@ -6,7 +6,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('admin-token') || '');
   const [admin, setAdmin] = useState(null);
-  const [loginData, setLoginData] = useState({ email: 'admin@randomchat.local', password: 'admin123' });
+  const [loginData, setLoginData] = useState({ email: 'admin@randomchat.local', password: '' });
   const [dashboard, setDashboard] = useState({ stats: {}, activeSessions: [], reports: [], recentAudit: [] });
   const [users, setUsers] = useState([]);
   const [status, setStatus] = useState('Ready');
