@@ -21,9 +21,9 @@ services:
       - key: ALLOWED_ORIGINS
         sync: false
 
-  - type: static_site
+  - type: web
+    runtime: static
     name: random-chat-user
-    plan: free
     rootDir: userapp
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
@@ -33,11 +33,14 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_URL
-        sync: false
+        fromService:
+          type: web
+          name: random-chat-backend
+          envVarKey: RENDER_EXTERNAL_URL
 
-  - type: static_site
+  - type: web
+    runtime: static
     name: random-chat-admin
-    plan: free
     rootDir: admin
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
@@ -47,4 +50,7 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_URL
-        sync: false
+        fromService:
+          type: web
+          name: random-chat-backend
+          envVarKey: RENDER_EXTERNAL_URL
