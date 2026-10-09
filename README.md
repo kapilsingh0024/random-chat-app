@@ -105,7 +105,7 @@ The root `render.yaml` defines three separate Render services: the backend, user
 2. Create a MongoDB Atlas database and database user. Set its network access to allow Render connections; Render's outbound IPs may change. Copy the Atlas connection string and replace its username and password with the database user's credentials.
 3. In the backend service's Environment settings, set `MONGODB_URI`, a strong unique `ADMIN_PASSWORD`, `ADMIN_EMAIL`, and `ALLOWED_ORIGINS`. Use the two frontend origins separated by a comma, for example `https://random-chat-user.onrender.com,https://random-chat-admin.onrender.com`. Keep the generated `JWT_SECRET` private. Save the changes and deploy the backend.
 4. Wait for the backend's `/health` endpoint to return `{"status":"ok"}`. Copy its `https://...onrender.com` URL.
-5. In both static services, set `VITE_API_URL` to that complete backend URL, including `https://`. Save and redeploy each frontend; Vite embeds this value during the build.
+5. The Blueprint automatically supplies the backend's `RENDER_EXTERNAL_URL` to both frontend builds as `VITE_API_URL`. No manual frontend URL setting is needed.
 6. Confirm the admin service's URL is included in the backend's `ALLOWED_ORIGINS` value, and update/redeploy the backend if either frontend URL changes.
 
 The admin login uses the `ADMIN_EMAIL` and `ADMIN_PASSWORD` values configured for the backend. Do not use the example local credentials in production. Audio/video calling may also need a TURN service for users behind restrictive networks; STUN alone is not sufficient for every network.
