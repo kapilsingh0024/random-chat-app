@@ -21,7 +21,7 @@ services:
       - key: ALLOWED_ORIGINS
         sync: false
 
-  - type: static
+  - type: static_site
     name: random-chat-user
     plan: free
     rootDir: userapp
@@ -35,7 +35,7 @@ services:
       - key: VITE_API_URL
         sync: false
 
-  - type: static
+  - type: static_site
     name: random-chat-admin
     plan: free
     rootDir: admin
