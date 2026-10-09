@@ -17,7 +17,7 @@ services:
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
-        sync: false
+        generateValue: true
       - key: ALLOWED_ORIGINS
         sync: false
 
