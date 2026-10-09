@@ -26,6 +26,7 @@ export default function App() {
   const [input, setInput] = useState('');
   const [localAudioMuted, setLocalAudioMuted] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
+  const [remoteVideoReady, setRemoteVideoReady] = useState(false);
   const [blocked, setBlocked] = useState(false);
 
   const socketRef = useRef(null);
@@ -33,9 +34,23 @@ export default function App() {
   const remoteVideoRef = useRef(null);
   const localVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
+  const remoteStreamRef = useRef(null);
+  const pendingIceCandidatesRef = useRef([]);
 
-  const csr = useMemo(() => {
-    return { stun: { urls: 'stun:stun.l.google.com:19302' } };
+  const iceServers = useMemo(() => {
+    const servers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ];
+    const turnUrl = import.meta.env.VITE_TURN_SERVER;
+    if (turnUrl) {
+      servers.push({
+        urls: turnUrl,
+        username: import.meta.env.VITE_TURN_USERNAME,
+        credential: import.meta.env.VITE_TURN_PASSWORD,
+      });
+    }
+    return servers;
   }, []);
 
   const initSocket = (authToken) => {
@@ -64,17 +79,23 @@ export default function App() {
       setMatchWaiting(false);
       setActiveRoom(payload.roomId);
       setPeer(payload.peer);
+      setRemoteVideoReady(false);
       setStatus(`Matched with ${payload.peer?.name}`);
       setMessages([]);
 
       if (['audio', 'video', 'audio-video'].includes(payload.mode)) {
-        await startLocalMedia(payload.mode);
-        await createPeerConnection();
-        const pc = peerConnectionRef.current;
-        if (pc) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc:offer', { roomId: payload.roomId, offer });
+        try {
+          await startLocalMedia(payload.mode);
+          const pc = await createPeerConnection(payload.roomId);
+          if (payload.isOfferer) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('webrtc:offer', { roomId: payload.roomId, offer, mode: payload.mode });
+          }
+        } catch (error) {
+          setStatus(error.name === 'NotAllowedError'
+            ? 'Allow camera and microphone access to start the call.'
+            : 'Could not start camera or microphone. Check device permissions.');
         }
       }
     });
@@ -92,6 +113,10 @@ export default function App() {
         peerConnectionRef.current.close();
         peerConnectionRef.current = null;
       }
+      pendingIceCandidatesRef.current = [];
+      remoteStreamRef.current = null;
+      setRemoteVideoReady(false);
+      setCameraOn(false);
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
         localStreamRef.current = null;
@@ -100,25 +125,34 @@ export default function App() {
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     });
 
-    socket.on('webrtc:offer', async ({ offer, from }) => {
-      await createPeerConnection();
-      const pc = peerConnectionRef.current;
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('webrtc:answer', { roomId: activeRoom, answer });
+    socket.on('webrtc:offer', async ({ offer, roomId, mode }) => {
+      try {
+        await startLocalMedia(mode || 'video');
+        const pc = await createPeerConnection(roomId);
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        await flushPendingIceCandidates(pc);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('webrtc:answer', { roomId, answer });
+      } catch (error) {
+        setStatus('Could not connect video. Check camera permissions and network.');
+      }
     });
 
     socket.on('webrtc:answer', async ({ answer }) => {
       const pc = peerConnectionRef.current;
       if (!pc) return;
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      await flushPendingIceCandidates(pc);
     });
 
     socket.on('webrtc:ice-candidate', ({ candidate }) => {
       const pc = peerConnectionRef.current;
-      if (pc && candidate) {
+      if (!candidate) return;
+      if (pc?.remoteDescription) {
         pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+      } else {
+        pendingIceCandidatesRef.current.push(candidate);
       }
     });
 
@@ -132,28 +166,52 @@ export default function App() {
     });
   };
 
-  const createPeerConnection = async () => {
+  const createPeerConnection = async (roomId) => {
     if (peerConnectionRef.current) return peerConnectionRef.current;
 
-    const pc = new RTCPeerConnection({ iceServers: [csr.stun] });
+    const pc = new RTCPeerConnection({ iceServers });
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
     }
 
     pc.ontrack = (event) => {
-      const remoteStream = event.streams[0];
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+      const [remoteStream] = event.streams;
+      if (remoteStream) {
+        remoteStreamRef.current = remoteStream;
+      } else {
+        remoteStreamRef.current ||= new MediaStream();
+        remoteStreamRef.current.addTrack(event.track);
+      }
+      if (remoteVideoRef.current && remoteStreamRef.current) {
+        remoteVideoRef.current.srcObject = remoteStreamRef.current;
+        remoteVideoRef.current.play().catch(() => {});
+      }
+      if (event.track.kind === 'video') setRemoteVideoReady(true);
     };
 
     pc.onicecandidate = (event) => {
-      if (event.candidate && activeRoom) {
-        socketRef.current.emit('webrtc:ice-candidate', { roomId: activeRoom, candidate: event.candidate });
+      if (event.candidate && roomId) {
+        socketRef.current.emit('webrtc:ice-candidate', { roomId, candidate: event.candidate });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed') {
+        setStatus('Call connection failed. A TURN server may be needed on this network.');
       }
     };
 
     peerConnectionRef.current = pc;
     return pc;
+  };
+
+  const flushPendingIceCandidates = async (pc) => {
+    const candidates = pendingIceCandidatesRef.current;
+    pendingIceCandidatesRef.current = [];
+    await Promise.all(candidates.map((candidate) => (
+      pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
+    )));
   };
 
   const startLocalMedia = async (mode) => {
@@ -297,6 +355,16 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+    }
+    if (remoteVideoRef.current && remoteStreamRef.current) {
+      remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      remoteVideoRef.current.play().catch(() => {});
+    }
+  }, [activeRoom, chatMode, remoteVideoReady]);
+
+  useEffect(() => {
     if (!token) return;
 
     const fetchUser = async () => {
@@ -407,7 +475,7 @@ export default function App() {
   if (!user) return <div className="flex min-h-screen items-center justify-center p-6">{renderAuth()}</div>;
 
   return (
-    <div className="min-h-screen p-6 text-slate-100">
+    <div className="min-h-screen p-3 text-slate-100 sm:p-6">
       <div className="mx-auto max-w-6xl">
         <header className="mb-6 flex flex-col gap-4 rounded-2xl border border-slate-700 bg-slate-900/80 p-4 md:flex-row md:items-center md:justify-between">
           <div>
@@ -474,12 +542,12 @@ export default function App() {
           <main className="rounded-2xl border border-slate-700 bg-slate-900/80 p-5">
             {activeRoom ? (
               <>
-                <div className="mb-4 flex items-center justify-between">
+                <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="text-sm text-slate-400">Connected with</p>
                     <h3 className="text-xl font-semibold">{peer?.name || 'Stranger'}</h3>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <button className="bg-red-500 hover:bg-red-400" onClick={handleReport}>Report</button>
                     <button className="bg-orange-500 hover:bg-orange-400" onClick={handleBlock} disabled={blocked}>
                       {blocked ? 'Blocked' : 'Block'}
@@ -490,17 +558,24 @@ export default function App() {
                 </div>
 
                 {(chatMode === 'audio' || chatMode === 'video' || chatMode === 'audio-video') && (
-                  <div className="mb-5 grid gap-4 md:grid-cols-2">
+                  <div className="mb-5 grid gap-3 sm:grid-cols-2 sm:gap-4">
                     <div className="relative overflow-hidden rounded-xl border border-slate-700 bg-slate-950 p-2">
-                      <video ref={localVideoRef} autoPlay muted playsInline className="h-52 w-full rounded-lg object-cover" />
+                      <video ref={localVideoRef} autoPlay muted playsInline className="aspect-video w-full rounded-lg bg-slate-900 object-cover" />
+                      <span className="absolute bottom-4 left-4 rounded bg-slate-950/80 px-2 py-1 text-xs">You</span>
                     </div>
                     <div className="relative overflow-hidden rounded-xl border border-slate-700 bg-slate-950 p-2">
-                      <video ref={remoteVideoRef} autoPlay playsInline className="h-52 w-full rounded-lg object-cover" />
+                      <video ref={remoteVideoRef} autoPlay playsInline className="aspect-video w-full rounded-lg bg-slate-900 object-cover" />
+                      {!remoteVideoReady && (
+                        <div className="pointer-events-none absolute inset-2 flex items-center justify-center rounded-lg bg-slate-950/70 px-4 text-center text-sm text-slate-300">
+                          Waiting for the stranger's camera...
+                        </div>
+                      )}
+                      <span className="absolute bottom-4 left-4 rounded bg-slate-950/80 px-2 py-1 text-xs">{peer?.name || 'Stranger'}</span>
                     </div>
                   </div>
                 )}
 
-                <div className="mb-3 flex gap-2">
+                <div className="mb-3 flex flex-wrap gap-2">
                   <button className="bg-slate-700 text-slate-100 hover:bg-slate-600" onClick={toggleMute}>
                     {localAudioMuted ? 'Unmute audio' : 'Mute audio'}
                   </button>
@@ -521,8 +596,9 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="flex gap-2">
+                <div className="flex min-w-0 gap-2">
                   <input
+                    className="min-w-0 flex-1"
                     value={input}
                     onChange={(event) => setInput(event.target.value)}
                     placeholder="Type a message"
@@ -530,7 +606,7 @@ export default function App() {
                       if (event.key === 'Enter') sendChatMessage();
                     }}
                   />
-                  <button className="bg-cyan-500 text-slate-950 hover:bg-cyan-400" onClick={sendChatMessage}>Send</button>
+                  <button className="shrink-0 bg-cyan-500 text-slate-950 hover:bg-cyan-400" onClick={sendChatMessage}>Send</button>
                 </div>
               </>
             ) : (

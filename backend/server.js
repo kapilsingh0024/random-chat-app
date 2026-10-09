@@ -95,6 +95,8 @@ function getOtherUser(session, currentUserId) {
 }
 
 function canMatch(a, b) {
+  if (a.mode !== b.mode) return false;
+
   const matchesPreference = (source, target) => {
     if (source.preference === 'male') return target.gender === 'male';
     if (source.preference === 'female') return target.gender === 'female';
@@ -579,12 +581,22 @@ io.on('connection', (socket) => {
       const peerSocket = io.sockets.sockets.get(match.socketId);
       if (peerSocket) peerSocket.join(roomId);
 
-      io.to(roomId).emit('match:matched', {
+      socket.emit('match:matched', {
         roomId,
         mode,
+        isOfferer: true,
         peer: {
-          userId: userId === match.userId ? match.userId : userId,
-          name: userId === match.userId ? match.name : user.name,
+          userId: match.userId,
+          name: match.name,
+        },
+      });
+      peerSocket?.emit('match:matched', {
+        roomId,
+        mode,
+        isOfferer: false,
+        peer: {
+          userId,
+          name: user.name,
         },
       });
 
@@ -612,12 +624,12 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('chat:message', message);
   });
 
-  socket.on('webrtc:offer', ({ roomId, offer }) => {
+  socket.on('webrtc:offer', ({ roomId, offer, mode }) => {
     const session = state.activeSessions.get(roomId);
     if (!session) return;
     const peer = getOtherUser(session, userId);
     if (!peer) return;
-    io.to(peer.socketId).emit('webrtc:offer', { offer, from: userId, roomId });
+    io.to(peer.socketId).emit('webrtc:offer', { offer, from: userId, roomId, mode });
   });
 
   socket.on('webrtc:answer', ({ roomId, answer }) => {
