@@ -1,65 +1,54 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const dns = require('dns');
+const crypto = require('crypto');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { Server } = require('socket.io');
-require('dotenv').config();
 
-dns.setServers(['1.1.1.1', '1.0.0.1']);
+try { dns.setServers(['1.1.1.1', '1.0.0.1']); } catch (e) { /* keep default DNS */ }
 
 const User = require('./src/models/User');
 const Report = require('./src/models/Report');
 const AuditLog = require('./src/models/AuditLog');
-const { authMiddleware, adminAuthMiddleware } = require('./src/middleware/auth');
+const {
+  authMiddleware,
+  adminAuthMiddleware,
+  createToken,
+  createAdminToken,
+  accountProblem,
+  loadUserFromToken,
+  loadAdminFromToken,
+} = require('./src/middleware/auth');
+
+const isProd = process.env.NODE_ENV === 'production';
+if (!process.env.JWT_SECRET) {
+  console.error('JWT_SECRET is not set. Refusing to start.');
+  process.exit(1);
+}
 
 const app = express();
 const server = http.createServer(app);
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5174').split(',').map((origin) => origin.trim());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5174')
+  .split(',').map((o) => o.trim()).filter(Boolean);
+const corsOrigin = (origin, callback) =>
+  (!origin || allowedOrigins.includes(origin)) ? callback(null, true) : callback(new Error('Origin not allowed by CORS'));
 
-const io = new Server(server, {
-  cors: {
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Origin not allowed by CORS'));
-      }
-    },
-    credentials: true,
-  },
-});
-
+const io = new Server(server, { cors: { origin: corsOrigin, credentials: true }, maxHttpBufferSize: 1e5 });
 const adminIo = io.of('/admin');
-const authRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { message: 'Too many attempts. Please wait before trying again.' },
-});
 
-const state = {
-  waitingUsers: [],
-  activeSessions: new Map(),
-  socketUserMap: new Map(),
-  userSocketMap: new Map(),
-};
-
-function createToken(user) {
-  return jwt.sign(
-    {
-      id: user._id.toString(),
-      email: user.email,
-      role: user.role,
-    },
-    process.env.JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-}
+// ---------- small helpers ----------
+const MODES = ['text', 'audio', 'video', 'audio-video'];
+const PREFS = ['male', 'female', 'anyone'];
+const isId = (v) => typeof v === 'string' && /^[a-f0-9]{24}$/i.test(v);
+const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const reply = (ack, payload) => { if (typeof ack === 'function') ack(payload); };
+const safe = (fn) => async (...args) => { try { await fn(...args); } catch (e) { console.error('Handler error', e); } };
 
 function sanitizeUser(user) {
   return {
@@ -74,187 +63,267 @@ function sanitizeUser(user) {
   };
 }
 
-function createMatchRequest(user, socketId, mode = 'text') {
+function adminViewOfUser(user) {
   return {
-    userId: user._id.toString(),
-    name: user.name,
-    gender: user.gender,
-    preference: user.matchPreference || 'anyone',
-    mode,
-    socketId,
-    createdAt: Date.now(),
+    ...sanitizeUser(user),
+    isBanned: !!user.isBanned,
+    suspendedUntil: user.suspendedUntil || null,
+    lastLogin: user.lastLogin || null,
   };
 }
 
-function removeWaitingUser(userId) {
-  state.waitingUsers = state.waitingUsers.filter((entry) => entry.userId !== userId);
+async function addAuditLog(adminId, adminEmail, action, details = '') {
+  try {
+    await AuditLog.create({ adminId, adminEmail, action, details: String(details).slice(0, 500) });
+  } catch (e) { console.error('Audit log failed', e); }
 }
 
-function getOtherUser(session, currentUserId) {
-  return session.users.find((entry) => entry.userId !== currentUserId) || null;
+// ---------- in-memory live state (NOTHING here is ever written to the database) ----------
+const state = {
+  waitingUsers: [],
+  activeSessions: new Map(), // roomId -> { roomId, mode, startedAt, users:[{userId,name,socketId}], messages:[] }
+  userSocketMap: new Map(),  // userId -> socket.id
+  userRoomMap: new Map(),    // userId -> roomId
+};
+
+function allow(socket, key, max, windowMs) {
+  const now = Date.now();
+  socket.data.rate = socket.data.rate || {};
+  const hits = (socket.data.rate[key] = socket.data.rate[key] || []);
+  while (hits.length && now - hits[0] > windowMs) hits.shift();
+  if (hits.length >= max) return false;
+  hits.push(now);
+  return true;
 }
+
+const removeWaitingUser = (userId) => {
+  state.waitingUsers = state.waitingUsers.filter((e) => e.userId !== userId);
+};
+
+function sessionFor(socket, roomId) {
+  if (typeof roomId !== 'string') return null;
+  const session = state.activeSessions.get(roomId);
+  if (!session) return null;
+  const member = session.users.find((u) => u.userId === socket.userId && u.socketId === socket.id);
+  return member ? session : null;
+}
+const peerOf = (session, userId) => session.users.find((u) => u.userId !== userId);
 
 function canMatch(a, b) {
   if (a.mode !== b.mode) return false;
-
-  const matchesPreference = (source, target) => {
-    if (source.preference === 'male') return target.gender === 'male';
-    if (source.preference === 'female') return target.gender === 'female';
-    return true;
-  };
-
-  return matchesPreference(a, b) && matchesPreference(b, a);
+  if (a.blocked.has(b.userId) || b.blocked.has(a.userId)) return false;
+  const wants = (source, target) => source.preference === 'anyone' || source.preference === target.gender;
+  return wants(a, b) && wants(b, a);
 }
 
 function findMatch(request) {
-  for (let index = 0; index < state.waitingUsers.length; index += 1) {
-    const candidate = state.waitingUsers[index];
-    if (candidate.userId === request.userId) continue;
-    if (canMatch(request, candidate)) return candidate;
+  for (let i = 0; i < state.waitingUsers.length; i += 1) {
+    const candidate = state.waitingUsers[i];
+    if (!io.sockets.sockets.get(candidate.socketId)) { // stale entry
+      state.waitingUsers.splice(i, 1);
+      i -= 1;
+      continue;
+    }
+    if (candidate.userId !== request.userId && canMatch(request, candidate)) return candidate;
   }
   return null;
 }
 
-async function broadcastAdminStats() {
-  const totalUsers = await User.countDocuments({ isDeleted: false });
-  const totalReports = await Report.countDocuments({});
-  const activeSessions = Array.from(state.activeSessions.values()).map((session) => ({
-    roomId: session.roomId,
-    mode: session.mode,
-    startedAt: session.startedAt,
-    duration: Date.now() - session.startedAt,
-    users: session.users.map((user) => ({ userId: user.userId, name: user.name })),
+// ---------- admin dashboard (debounced so it never hammers the DB) ----------
+async function buildDashboard() {
+  const [totalUsers, totalReports, openReports, reports, recentAudit] = await Promise.all([
+    User.countDocuments({ isDeleted: false, role: 'user' }),
+    Report.countDocuments({}),
+    Report.countDocuments({ status: 'open' }),
+    Report.find().sort({ createdAt: -1 }).limit(20).populate('reporterId reportedUserId', 'name email').lean(),
+    AuditLog.find().sort({ createdAt: -1 }).limit(30).lean(),
+  ]);
+  const activeSessions = Array.from(state.activeSessions.values()).map((s) => ({
+    roomId: s.roomId,
+    mode: s.mode,
+    startedAt: s.startedAt,
+    duration: Date.now() - s.startedAt,
+    users: s.users.map((u) => ({ userId: u.userId, name: u.name })),
   }));
-
-  const payload = {
+  return {
     stats: {
       onlineUsers: state.userSocketMap.size,
       activeSessions: state.activeSessions.size,
+      waitingUsers: state.waitingUsers.length,
       totalUsers,
       totalReports,
+      openReports,
     },
     activeSessions,
-    reports: await Report.find().sort({ createdAt: -1 }).limit(20).lean(),
-    recentAudit: await AuditLog.find().sort({ createdAt: -1 }).limit(10).lean(),
+    reports,
+    recentAudit,
   };
-
-  adminIo.emit('dashboard:update', payload);
-  return payload;
 }
 
-async function endSession(roomId, endedByUserId, reason = 'ended') {
+let broadcastTimer = null;
+function scheduleBroadcast() {
+  if (broadcastTimer || adminIo.sockets.size === 0) return;
+  broadcastTimer = setTimeout(async () => {
+    broadcastTimer = null;
+    try { adminIo.emit('dashboard:update', await buildDashboard()); } catch (e) { console.error(e); }
+  }, 1000);
+}
+
+// ---------- sessions ----------
+// Ending a session wipes its messages from memory and tells BOTH people.
+function endSession(roomId, reason = 'ended', endedByUserId = null) {
   const session = state.activeSessions.get(roomId);
-  if (!session) return;
-
-  const otherUser = getOtherUser(session, endedByUserId);
-
-  if (otherUser) {
-    const targetSocket = io.sockets.sockets.get(otherUser.socketId);
-    if (targetSocket) {
-      targetSocket.emit('session:ended', {
-        roomId,
-        reason,
-        endedByUserId,
-      });
+  if (!session) return false;
+  state.activeSessions.delete(roomId);
+  session.messages.length = 0;
+  for (const u of session.users) {
+    if (state.userRoomMap.get(u.userId) === roomId) state.userRoomMap.delete(u.userId);
+    const s = io.sockets.sockets.get(u.socketId);
+    if (s) {
+      s.leave(roomId);
+      s.emit('session:ended', { roomId, reason, endedByUserId });
     }
   }
+  adminIo.to(`mod:${roomId}`).emit('moderation:ended', { roomId });
+  scheduleBroadcast();
+  return true;
+}
 
-  const endingSocket = io.sockets.sockets.get(state.userSocketMap.get(endedByUserId));
-  if (endingSocket) {
-    endingSocket.emit('session:ended', {
-      roomId,
-      reason,
-      endedByUserId,
-    });
+function kickUser(userId, reason) {
+  const socketId = state.userSocketMap.get(userId);
+  const s = socketId && io.sockets.sockets.get(socketId);
+  if (s) { s.emit('auth:kicked', { reason }); s.disconnect(true); }
+}
+
+async function startMatching(socket, preference, mode) {
+  const userId = socket.userId;
+  const current = state.userRoomMap.get(userId);
+  if (current) endSession(current, 'next', userId);
+  removeWaitingUser(userId);
+
+  const user = await User.findById(userId);
+  const problem = accountProblem(user);
+  if (problem) { socket.emit('match:error', { message: problem }); return; }
+  if (!socket.connected || state.userRoomMap.has(userId)) return;
+  removeWaitingUser(userId);
+
+  const request = {
+    userId,
+    name: user.name,
+    gender: user.gender,
+    preference,
+    mode,
+    socketId: socket.id,
+    blocked: new Set((user.blockedUsers || []).map(String)),
+    createdAt: Date.now(),
+  };
+
+  const match = findMatch(request);
+  if (!match) {
+    state.waitingUsers.push(request);
+    socket.emit('match:waiting', { message: 'Looking for a match...' });
+    scheduleBroadcast();
+    return;
   }
 
-  state.activeSessions.delete(roomId);
-  await broadcastAdminStats();
+  removeWaitingUser(match.userId);
+  const peerSocket = io.sockets.sockets.get(match.socketId);
+  const roomId = crypto.randomUUID();
+  const session = {
+    roomId,
+    mode,
+    startedAt: Date.now(),
+    users: [
+      { userId, name: user.name, socketId: socket.id },
+      { userId: match.userId, name: match.name, socketId: match.socketId },
+    ],
+    messages: [],
+  };
+  state.activeSessions.set(roomId, session);
+  state.userRoomMap.set(userId, roomId);
+  state.userRoomMap.set(match.userId, roomId);
+  socket.join(roomId);
+  peerSocket.join(roomId);
+
+  socket.emit('match:matched', { roomId, mode, isOfferer: true, peer: { userId: match.userId, name: match.name } });
+  peerSocket.emit('match:matched', { roomId, mode, isOfferer: false, peer: { userId, name: user.name } });
+  scheduleBroadcast();
 }
 
-async function addAuditLog(adminId, adminEmail, action, details = '') {
-  await AuditLog.create({
-    adminId,
-    adminEmail,
-    action,
-    details,
-  });
-}
+// ---------- Express ----------
+app.set('trust proxy', 1); // Render sits behind a proxy; needed for correct rate limiting
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.use(express.json({ limit: '20kb' }));
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Origin not allowed by CORS'));
-      }
-    },
-    credentials: true,
-  })
-);
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
+const limiterOpts = { standardHeaders: true, legacyHeaders: false };
+const authRateLimiter = rateLimit({ ...limiterOpts, windowMs: 60 * 1000, max: 10, message: { message: 'Too many attempts. Please wait before trying again.' } });
+const adminLoginLimiter = rateLimit({ ...limiterOpts, windowMs: 15 * 60 * 1000, max: 8, message: { message: 'Too many admin login attempts. Try again later.' } });
+const apiLimiter = rateLimit({ ...limiterOpts, windowMs: 60 * 1000, max: 240, message: { message: 'Too many requests.' } });
+const reportLimiter = rateLimit({
+  ...limiterOpts,
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => req.user.id,
+  message: { message: 'Report limit reached. Try again later.' },
+});
+app.use('/api', apiLimiter);
 
 async function ensureAdminUser() {
-  const adminEmail = process.env.ADMIN_EMAIL || 'admin@randomchat.local';
-  const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@randomchat.local').toLowerCase();
+  const existing = await User.findOne({ email: adminEmail });
+  if (existing) return existing;
 
-  const existingAdmin = await User.findOne({ email: adminEmail });
-  if (existingAdmin) return existingAdmin;
-
-  const admin = await User.create({
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (!adminPassword || (isProd && adminPassword === 'admin123')) {
+    console.warn('No safe ADMIN_PASSWORD set - admin account NOT created.');
+    return null;
+  }
+  return User.create({
     name: 'System Admin',
     email: adminEmail,
-    passwordHash: await bcrypt.hash(adminPassword, 10),
+    passwordHash: await bcrypt.hash(adminPassword, 12),
     gender: 'female',
     ageConfirmed: true,
     role: 'admin',
     matchPreference: 'anyone',
   });
-
-  return admin;
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
+// ----- user auth -----
 app.post('/api/auth/signup', authRateLimiter, async (req, res) => {
   try {
-    const { name, email, password, gender, ageConfirmed, matchPreference } = req.body;
+    const name = str(req.body.name, 40);
+    const email = str(req.body.email, 120).toLowerCase();
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const gender = str(req.body.gender, 10).toLowerCase();
+    const matchPreference = PREFS.includes(req.body.matchPreference) ? req.body.matchPreference : 'anyone';
 
-    if (!name || !email || !password || !gender || !ageConfirmed) {
-      return res.status(400).json({ message: 'Name, email, password, gender and age confirmation are required.' });
-    }
+    if (!name) return res.status(400).json({ message: 'Name is required.' });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ message: 'Enter a valid email.' });
+    if (password.length < 8 || password.length > 100) return res.status(400).json({ message: 'Password must be 8-100 characters.' });
+    if (!['male', 'female'].includes(gender)) return res.status(400).json({ message: 'Gender must be male or female.' });
+    if (req.body.ageConfirmed !== true) return res.status(400).json({ message: 'You must confirm that you are 18 or older.' });
 
-    const normalizedGender = gender.toLowerCase();
-    if (!['male', 'female'].includes(normalizedGender)) {
-      return res.status(400).json({ message: 'Gender must be male or female.' });
-    }
+    if (await User.exists({ email })) return res.status(409).json({ message: 'User already exists with this email.' });
 
-    const emailExists = await User.findOne({ email: email.toLowerCase() });
-    if (emailExists) {
-      return res.status(409).json({ message: 'User already exists with this email.' });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 10);
     const createdUser = await User.create({
-      name,
-      email: email.toLowerCase(),
-      passwordHash,
-      gender: normalizedGender,
+      name, email, gender, matchPreference,
+      passwordHash: await bcrypt.hash(password, 12),
       ageConfirmed: true,
-      matchPreference: matchPreference || 'anyone',
       role: 'user',
     });
-
-    const token = createToken(createdUser);
-    res.status(201).json({
-      user: sanitizeUser(createdUser),
-      token,
-    });
+    res.status(201).json({ user: sanitizeUser(createdUser), token: createToken(createdUser) });
   } catch (error) {
+    if (error && error.code === 11000) return res.status(409).json({ message: 'User already exists with this email.' });
     console.error('Signup error', error);
     res.status(500).json({ message: 'Failed to create user account.' });
   }
@@ -262,469 +331,405 @@ app.post('/api/auth/signup', authRateLimiter, async (req, res) => {
 
 app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = str(req.body.email, 120).toLowerCase();
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    if (!email || !password) return res.status(400).json({ message: 'Email and password are required.' });
 
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
-    }
-
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user || user.isDeleted || user.isBanned) {
+    const user = await User.findOne({ email, role: 'user' });
+    if (!user || user.isDeleted || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
-
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) {
-      return res.status(401).json({ message: 'Invalid credentials.' });
-    }
+    const problem = accountProblem(user);
+    if (problem) return res.status(403).json({ message: problem });
 
     user.lastLogin = new Date();
     await user.save();
-
-    const token = createToken(user);
-    res.json({
-      user: sanitizeUser(user),
-      token,
-    });
+    res.json({ user: sanitizeUser(user), token: createToken(user) });
   } catch (error) {
     console.error('Login error', error);
     res.status(500).json({ message: 'Failed to log in.' });
   }
 });
 
+// Admin gives the user a one-hour link; the user chooses a new password with it.
+app.post('/api/auth/reset', authRateLimiter, async (req, res) => {
+  try {
+    const token = str(req.body.token, 200);
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    if (password.length < 8 || password.length > 100) return res.status(400).json({ message: 'Password must be 8-100 characters.' });
+    const user = token && await User.findOne({ resetTokenHash: sha(token), resetExpires: { $gt: new Date() } });
+    if (!user) return res.status(400).json({ message: 'Reset link is invalid or expired.' });
+    user.passwordHash = await bcrypt.hash(password, 12);
+    user.resetTokenHash = null;
+    user.resetExpires = null;
+    await user.save();
+    res.json({ message: 'Password updated. You can log in now.' });
+  } catch (error) {
+    console.error('Reset error', error);
+    res.status(500).json({ message: 'Unable to reset password.' });
+  }
+});
+
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('-passwordHash');
-    if (!user) {
-      return res.status(404).json({ message: 'User not found.' });
-    }
-
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
     res.json({ user: sanitizeUser(user) });
   } catch (error) {
     res.status(500).json({ message: 'Unable to load profile.' });
   }
 });
 
-app.post('/api/reports', authMiddleware, async (req, res) => {
-  try {
-    const { reportedUserId, reason, messageSnippet } = req.body;
+// Optional: time-limited TURN credentials (coturn "use-auth-secret").
+// Set TURN_URLS + TURN_SECRET on the backend to use it; otherwise the client falls back to VITE_TURN_*.
+app.get('/api/ice', authMiddleware, (req, res) => {
+  const list = (v) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const iceServers = [];
+  const stun = list(process.env.STUN_URLS);
+  if (stun.length) iceServers.push({ urls: stun });
+  const turn = list(process.env.TURN_URLS);
+  if (turn.length && process.env.TURN_SECRET) {
+    const username = `${Math.floor(Date.now() / 1000) + 3600}:${req.user.id}`;
+    const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
+    iceServers.push({ urls: turn, username, credential });
+  }
+  res.json({ iceServers });
+});
 
-    if (!reportedUserId || !reason) {
-      return res.status(400).json({ message: 'Reported user and reason are required.' });
+// ----- reports: reporter id, reported id, time, reason (+ messages ONLY if the reporter agreed) -----
+app.post('/api/reports', authMiddleware, reportLimiter, async (req, res) => {
+  try {
+    const { reportedUserId, messages } = req.body;
+    const reason = str(req.body.reason, 500);
+    if (!isId(reportedUserId) || reportedUserId === req.user.id) return res.status(400).json({ message: 'Invalid user.' });
+    if (reason.length < 3) return res.status(400).json({ message: 'Please tell us what happened.' });
+
+    // You can only report the person you are chatting with right now.
+    const roomId = state.userRoomMap.get(req.user.id);
+    const session = roomId && state.activeSessions.get(roomId);
+    if (!session || !session.users.some((u) => u.userId === reportedUserId)) {
+      return res.status(403).json({ message: 'You can only report the person you are chatting with.' });
     }
 
-    const report = await Report.create({
-      reporterId: req.user.id,
-      reportedUserId,
-      reason,
-      messageSnippet: messageSnippet || '',
-    });
+    const attached = Array.isArray(messages)
+      ? messages.slice(-10).map((m) => ({ from: m && m.from === req.user.id ? 'reporter' : 'reported', text: str(m && m.text, 500) })).filter((m) => m.text)
+      : [];
 
-    adminIo.emit('report:new', {
-      report,
-      reporterId: req.user.id,
-      reportedUserId,
-    });
-
-    await broadcastAdminStats();
-
-    res.status(201).json({ message: 'Report submitted successfully.', report });
+    await Report.create({ reporterId: req.user.id, reportedUserId, reason, messages: attached });
+    adminIo.emit('report:new', { reportedUserId });
+    scheduleBroadcast();
+    res.status(201).json({ message: 'Report submitted. Thank you.' });
   } catch (error) {
     console.error('Report error', error);
     res.status(500).json({ message: 'Failed to save report.' });
   }
 });
 
-app.post('/api/admin/login', authRateLimiter, async (req, res) => {
+// ----- admin API -----
+app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
-    }
-
-    const user = await User.findOne({ email: email.toLowerCase(), role: 'admin' });
-    if (!user) {
+    const email = str(req.body.email, 120).toLowerCase();
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const user = email && password && await User.findOne({ email, role: 'admin' });
+    if (!user || accountProblem(user) || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: 'Invalid admin credentials.' });
     }
-
-    const valid = await bcrypt.compare(password, user.passwordHash);
-    if (!valid) {
-      return res.status(401).json({ message: 'Invalid admin credentials.' });
-    }
-
-    const token = createToken(user);
-    res.json({
-      user: sanitizeUser(user),
-      token,
-    });
+    await addAuditLog(user._id, user.email, 'admin_login');
+    res.json({ user: sanitizeUser(user), token: createAdminToken(user) });
   } catch (error) {
     console.error('Admin login error', error);
     res.status(500).json({ message: 'Unable to log in as admin.' });
   }
 });
 
-app.get('/api/admin/dashboard', adminAuthMiddleware, async (req, res) => {
-  try {
-    const payload = await broadcastAdminStats();
-    res.json(payload);
-  } catch (error) {
-    console.error('Dashboard error', error);
-    res.status(500).json({ message: 'Unable to load admin dashboard.' });
+app.use('/api/admin', adminAuthMiddleware);
+
+const lastView = new Map(); // throttle noisy "view" audit entries to once per 5 minutes
+function auditView(admin, action, details = '') {
+  const key = `${admin.id}:${action}`;
+  if (Date.now() - (lastView.get(key) || 0) < 5 * 60 * 1000) return;
+  lastView.set(key, Date.now());
+  addAuditLog(admin.id, admin.email, action, details);
+}
+const audit = (req, action, details) => addAuditLog(req.admin.id, req.admin.email, action, details);
+const wrap = (message, fn) => async (req, res) => {
+  try { await fn(req, res); } catch (error) { console.error(message, error); res.status(500).json({ message }); }
+};
+
+// Loads a normal (non-admin) user from :id, or answers with an error.
+async function targetUser(req, res) {
+  if (!isId(req.params.id)) { res.status(400).json({ message: 'Invalid user id.' }); return null; }
+  const user = await User.findById(req.params.id);
+  if (!user) { res.status(404).json({ message: 'User not found.' }); return null; }
+  if (user.role === 'admin') { res.status(403).json({ message: 'Admin accounts cannot be changed from the panel.' }); return null; }
+  return user;
+}
+
+app.get('/api/admin/me', (req, res) => res.json({ user: req.admin }));
+
+app.get('/api/admin/dashboard', wrap('Unable to load admin dashboard.', async (req, res) => {
+  auditView(req.admin, 'view_dashboard');
+  res.json(await buildDashboard());
+}));
+
+app.get('/api/admin/sessions', wrap('Unable to load sessions.', async (req, res) => {
+  auditView(req.admin, 'view_sessions');
+  res.json({
+    sessions: Array.from(state.activeSessions.values()).map((s) => ({
+      roomId: s.roomId, mode: s.mode, startedAt: s.startedAt,
+      users: s.users.map((u) => ({ userId: u.userId, name: u.name })),
+    })),
+  });
+}));
+
+app.post('/api/admin/sessions/:roomId/end', wrap('Unable to end session.', async (req, res) => {
+  const session = state.activeSessions.get(req.params.roomId);
+  if (!session) return res.status(404).json({ message: 'Session not found (already ended).' });
+  const names = session.users.map((u) => u.name).join(' & ');
+  endSession(req.params.roomId, 'admin-ended');
+  await audit(req, 'end_session', `Ended session of ${names} (${req.params.roomId}).`);
+  res.json({ message: 'Session ended successfully.' });
+}));
+
+app.get('/api/admin/users', wrap('Unable to load users.', async (req, res) => {
+  const search = str(req.query.search, 60);
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const filter = { isDeleted: false };
+  if (search) {
+    const rx = new RegExp(escapeRegex(search), 'i');
+    filter.$or = [{ name: rx }, { email: rx }];
   }
-});
+  auditView(req.admin, 'view_users', search ? `search: ${search}` : '');
+  const [users, total] = await Promise.all([
+    User.find(filter).select('-passwordHash -resetTokenHash').sort({ createdAt: -1 }).skip((page - 1) * 50).limit(50).lean(),
+    User.countDocuments(filter),
+  ]);
+  res.json({ users: users.map(adminViewOfUser), total, page });
+}));
 
-app.get('/api/admin/sessions', adminAuthMiddleware, async (req, res) => {
-  try {
-    const sessions = Array.from(state.activeSessions.values()).map((session) => ({
-      roomId: session.roomId,
-      mode: session.mode,
-      startedAt: session.startedAt,
-      users: session.users,
-    }));
-    res.json({ sessions });
-  } catch (error) {
-    console.error('Sessions list error', error);
-    res.status(500).json({ message: 'Unable to load sessions.' });
-  }
-});
+app.post('/api/admin/users/:id/ban', wrap('Unable to ban user.', async (req, res) => {
+  const user = await targetUser(req, res); if (!user) return;
+  user.isBanned = true;
+  await user.save();
+  kickUser(user._id.toString(), 'banned');
+  await audit(req, 'ban_user', `User ${user.email} was banned.`);
+  scheduleBroadcast();
+  res.json({ message: 'User banned successfully.' });
+}));
 
-app.post('/api/admin/sessions/:roomId/end', adminAuthMiddleware, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    if (!roomId) {
-      return res.status(400).json({ message: 'Session roomId is required.' });
-    }
+app.post('/api/admin/users/:id/unban', wrap('Unable to unban user.', async (req, res) => {
+  const user = await targetUser(req, res); if (!user) return;
+  user.isBanned = false;
+  user.suspendedUntil = null;
+  await user.save();
+  await audit(req, 'unban_user', `User ${user.email} was unbanned.`);
+  res.json({ message: 'User can log in again.' });
+}));
 
-    await endSession(roomId, 'admin', 'admin-ended');
-    await addAuditLog(req.admin.id, req.admin.email, 'end_session', `Admin ended room ${roomId}.`);
-    res.json({ message: 'Session ended successfully.' });
-  } catch (error) {
-    console.error('End session error', error);
-    res.status(500).json({ message: 'Unable to end session.' });
-  }
-});
+app.post('/api/admin/users/:id/suspend', wrap('Unable to suspend user.', async (req, res) => {
+  const user = await targetUser(req, res); if (!user) return;
+  const days = Math.min(365, Math.max(1, parseInt(req.body.days, 10) || 7));
+  user.suspendedUntil = new Date(Date.now() + days * 86400000);
+  await user.save();
+  kickUser(user._id.toString(), 'suspended');
+  await audit(req, 'suspend_user', `User ${user.email} suspended for ${days} day(s).`);
+  scheduleBroadcast();
+  res.json({ message: `User suspended for ${days} day(s).` });
+}));
 
-app.get('/api/admin/users', adminAuthMiddleware, async (req, res) => {
-  try {
-    const { search = '' } = req.query;
-    const filter = {
-      isDeleted: false,
-      ...(search
-        ? {
-            $or: [
-              { name: { $regex: search, $options: 'i' } },
-              { email: { $regex: search, $options: 'i' } },
-            ],
-          }
-        : {}),
-    };
+app.post('/api/admin/users/:id/delete', wrap('Unable to delete user.', async (req, res) => {
+  const user = await targetUser(req, res); if (!user) return;
+  kickUser(user._id.toString(), 'deleted');
+  await User.deleteOne({ _id: user._id }); // real delete, the email can be used again
+  await audit(req, 'delete_user', `User ${user.email} was deleted.`);
+  scheduleBroadcast();
+  res.json({ message: 'User deleted successfully.' });
+}));
 
-    const users = await User.find(filter).select('-passwordHash').sort({ createdAt: -1 }).lean();
-    res.json({ users: users.map((user) => sanitizeUser(user)) });
-  } catch (error) {
-    console.error('Users list error', error);
-    res.status(500).json({ message: 'Unable to load users.' });
-  }
-});
+app.post('/api/admin/users/:id/reset-password', wrap('Unable to reset password.', async (req, res) => {
+  const user = await targetUser(req, res); if (!user) return;
+  const token = crypto.randomBytes(32).toString('hex');
+  user.resetTokenHash = sha(token);
+  user.resetExpires = new Date(Date.now() + 60 * 60 * 1000);
+  await user.save();
+  const base = (process.env.CLIENT_URL || allowedOrigins[0] || '').replace(/\/$/, '');
+  await audit(req, 'reset_password', `Reset link created for ${user.email}.`);
+  res.json({ message: 'Reset link created (valid for 1 hour). Send it to the user.', resetLink: `${base}/?reset=${token}` });
+}));
 
-app.post('/api/admin/users/:id/ban', adminAuthMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ message: 'User not found.' });
+app.get('/api/admin/reports', wrap('Unable to load reports.', async (req, res) => {
+  auditView(req.admin, 'view_reports');
+  const reports = await Report.find().sort({ createdAt: -1 }).limit(200).populate('reporterId reportedUserId', 'name email').lean();
+  res.json({ reports });
+}));
 
-    user.isBanned = true;
-    await user.save();
-    await addAuditLog(req.admin.id, req.admin.email, 'ban_user', `User ${user.email} was banned.`);
-    await broadcastAdminStats();
-    res.json({ message: 'User banned successfully.' });
-  } catch (error) {
-    console.error('Ban user error', error);
-    res.status(500).json({ message: 'Unable to ban user.' });
-  }
-});
-
-app.post('/api/admin/users/:id/delete', adminAuthMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-
-    user.isDeleted = true;
-    await user.save();
-    await addAuditLog(req.admin.id, req.admin.email, 'delete_user', `User ${user.email} was deleted.`);
-    await broadcastAdminStats();
-    res.json({ message: 'User deleted successfully.' });
-  } catch (error) {
-    console.error('Delete user error', error);
-    res.status(500).json({ message: 'Unable to delete user.' });
-  }
-});
-
-app.post('/api/admin/users/:id/reset-password', adminAuthMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-
-    const temporaryPassword = `Temp${Math.random().toString(36).slice(2, 8)}`;
-    user.passwordHash = await bcrypt.hash(temporaryPassword, 10);
-    await user.save();
-    await addAuditLog(req.admin.id, req.admin.email, 'reset_password', `Password reset for ${user.email}.`);
-
-    res.json({
-      message: 'Temporary password generated.',
-      temporaryPassword,
-    });
-  } catch (error) {
-    console.error('Reset password error', error);
-    res.status(500).json({ message: 'Unable to reset password.' });
-  }
-});
-
-app.get('/api/admin/reports', adminAuthMiddleware, async (req, res) => {
-  try {
-    const reports = await Report.find().sort({ createdAt: -1 }).lean();
-    res.json({ reports });
-  } catch (error) {
-    res.status(500).json({ message: 'Unable to load reports.' });
-  }
-});
-
-app.post('/api/admin/reports/:id/resolve', adminAuthMiddleware, async (req, res) => {
-  try {
+for (const [action, status] of [['resolve', 'resolved'], ['dismiss', 'dismissed']]) {
+  app.post(`/api/admin/reports/:id/${action}`, wrap('Unable to update report.', async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid report id.' });
     const report = await Report.findById(req.params.id);
     if (!report) return res.status(404).json({ message: 'Report not found.' });
-
-    report.status = 'resolved';
+    report.status = status;
     await report.save();
-    await addAuditLog(req.admin.id, req.admin.email, 'resolve_report', `Report ${report._id} was marked resolved.`);
-    await broadcastAdminStats();
-    res.json({ message: 'Report marked as resolved.' });
-  } catch (error) {
-    console.error('Resolve report error', error);
-    res.status(500).json({ message: 'Unable to resolve report.' });
-  }
-});
+    await audit(req, `${action}_report`, `Report ${report._id} marked ${status}.`);
+    scheduleBroadcast();
+    res.json({ message: `Report marked as ${status}.` });
+  }));
+}
+
+app.get('/api/admin/audit', wrap('Unable to load audit log.', async (req, res) => {
+  res.json({ logs: await AuditLog.find().sort({ createdAt: -1 }).limit(200).lean() });
+}));
 
 app.use((error, req, res, next) => {
   console.error('Unhandled app error', error);
   res.status(500).json({ message: 'Server error.' });
 });
 
+// ---------- user sockets ----------
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
     if (!token) return next(new Error('Authentication token missing.'));
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select('-passwordHash');
-
-    if (!user || user.isDeleted || user.isBanned) {
-      return next(new Error('User account is not active.'));
-    }
-
+    const user = await loadUserFromToken(token);
     socket.userId = user._id.toString();
-    socket.user = user;
     next();
   } catch (error) {
-    next(new Error('Invalid socket token.'));
+    next(new Error('Invalid or inactive account.'));
   }
 });
 
 io.on('connection', (socket) => {
   const userId = socket.userId;
-  state.socketUserMap.set(socket.id, userId);
+
+  // one live connection per account
+  const oldSocketId = state.userSocketMap.get(userId);
+  if (oldSocketId && oldSocketId !== socket.id) {
+    const old = io.sockets.sockets.get(oldSocketId);
+    if (old) { old.emit('auth:kicked', { reason: 'Signed in from another tab or device.' }); old.disconnect(true); }
+  }
   state.userSocketMap.set(userId, socket.id);
+  socket.emit('connected', { userId, status: 'connected' });
+  scheduleBroadcast();
 
-  socket.emit('connected', {
-    userId,
-    status: 'connected',
-  });
-
-  socket.on('match:request', async ({ preference, mode = 'text' } = {}) => {
-    try {
-      const user = await User.findById(userId);
-      if (!user || user.isDeleted || user.isBanned) {
-        return socket.emit('match:error', { message: 'User is not allowed to match.' });
-      }
-
-      const request = createMatchRequest(user, socket.id, mode);
-      request.preference = preference || user.matchPreference || 'anyone';
-
-      const existingIndex = state.waitingUsers.findIndex((entry) => entry.userId === userId);
-      if (existingIndex >= 0) state.waitingUsers.splice(existingIndex, 1);
-
-      state.waitingUsers.push(request);
-
-      const match = findMatch(request);
-      if (!match) {
-        socket.emit('match:waiting', { message: 'Looking for a match...' });
-        return;
-      }
-
-      removeWaitingUser(userId);
-      removeWaitingUser(match.userId);
-
-      const roomId = `room_${Date.now()}_${userId}_${match.userId}`;
-      const currentUserEntry = { userId, name: user.name, socketId: socket.id };
-      const matchUserEntry = { userId: match.userId, name: match.name, socketId: match.socketId };
-
-      const session = {
-        roomId,
-        mode,
-        startedAt: Date.now(),
-        users: [currentUserEntry, matchUserEntry],
-        messages: [],
-      };
-
-      state.activeSessions.set(roomId, session);
-
-      socket.join(roomId);
-      const peerSocket = io.sockets.sockets.get(match.socketId);
-      if (peerSocket) peerSocket.join(roomId);
-
-      socket.emit('match:matched', {
-        roomId,
-        mode,
-        isOfferer: true,
-        peer: {
-          userId: match.userId,
-          name: match.name,
-        },
-      });
-      peerSocket?.emit('match:matched', {
-        roomId,
-        mode,
-        isOfferer: false,
-        peer: {
-          userId,
-          name: user.name,
-        },
-      });
-
-      await broadcastAdminStats();
-    } catch (error) {
-      console.error('Match request error', error);
-      socket.emit('match:error', { message: 'Unable to find a match right now.' });
+  socket.on('match:request', safe(async ({ preference, mode } = {}) => {
+    if (!PREFS.includes(preference) || !MODES.includes(mode)) {
+      return socket.emit('match:error', { message: 'Invalid match options.' });
     }
-  });
+    if (!allow(socket, 'match', 20, 60 * 1000)) {
+      return socket.emit('match:error', { message: 'Too many requests. Slow down a little.' });
+    }
+    socket.data.lastMatch = { preference, mode };
+    await startMatching(socket, preference, mode);
+  }));
 
-  socket.on('chat:message', ({ roomId, text } = {}) => {
-    if (!roomId || !text) return;
-    const session = state.activeSessions.get(roomId);
-    if (!session) return;
+  socket.on('match:cancel', safe(() => {
+    state.waitingUsers = state.waitingUsers.filter((e) => e.socketId !== socket.id);
+    scheduleBroadcast();
+  }));
 
-    const message = {
-      from: userId,
-      text: String(text).slice(0, 500),
-      timestamp: Date.now(),
-    };
-
+  socket.on('chat:message', safe(({ roomId, text } = {}) => {
+    const session = sessionFor(socket, roomId);
+    const clean = str(text, 500);
+    if (!session || !clean || !allow(socket, 'msg', 10, 5000)) return;
+    const message = { from: userId, text: clean, timestamp: Date.now() };
     session.messages.push(message);
     if (session.messages.length > 50) session.messages.shift();
-
     io.to(roomId).emit('chat:message', message);
-  });
+    adminIo.to(`mod:${roomId}`).emit('moderation:message', { roomId, message });
+  }));
 
-  socket.on('webrtc:offer', ({ roomId, offer, mode }) => {
-    const session = state.activeSessions.get(roomId);
-    if (!session) return;
-    const peer = getOtherUser(session, userId);
-    if (!peer) return;
-    io.to(peer.socketId).emit('webrtc:offer', { offer, from: userId, roomId, mode });
-  });
+  // WebRTC signalling - only between the two members of the same session
+  const relay = (event, build) => socket.on(event, safe((data = {}) => {
+    const session = sessionFor(socket, data.roomId);
+    if (!session || JSON.stringify(data).length > 20000) return;
+    const peer = peerOf(session, userId);
+    if (peer) io.to(peer.socketId).emit(event, { ...build(data), from: userId, roomId: data.roomId });
+  }));
+  relay('webrtc:offer', (d) => ({ offer: d.offer, mode: d.mode }));
+  relay('webrtc:answer', (d) => ({ answer: d.answer }));
+  relay('webrtc:ice-candidate', (d) => ({ candidate: d.candidate }));
 
-  socket.on('webrtc:answer', ({ roomId, answer }) => {
-    const session = state.activeSessions.get(roomId);
-    if (!session) return;
-    const peer = getOtherUser(session, userId);
-    if (!peer) return;
-    io.to(peer.socketId).emit('webrtc:answer', { answer, from: userId, roomId });
-  });
-
-  socket.on('webrtc:ice-candidate', ({ roomId, candidate }) => {
-    const session = state.activeSessions.get(roomId);
-    if (!session) return;
-    const peer = getOtherUser(session, userId);
-    if (!peer) return;
-    io.to(peer.socketId).emit('webrtc:ice-candidate', { candidate, from: userId, roomId });
-  });
-
-  socket.on('session:next', async ({ roomId } = {}) => {
-    if (!roomId) return;
-    await endSession(roomId, userId, 'next');
-    socket.emit('match:waiting', { message: 'Finding another person...' });
-  });
-
-  socket.on('session:end', async ({ roomId } = {}) => {
-    if (!roomId) return;
-    await endSession(roomId, userId, 'ended');
-  });
-
-  socket.on('disconnect', async () => {
-    state.socketUserMap.delete(socket.id);
-    state.userSocketMap.delete(userId);
-    removeWaitingUser(userId);
-
-    for (const [roomId, session] of state.activeSessions.entries()) {
-      if (session.users.some((entry) => entry.userId === userId)) {
-        await endSession(roomId, userId, 'disconnect');
-      }
+  socket.on('session:next', safe(async ({ roomId } = {}) => {
+    if (!sessionFor(socket, roomId)) {
+      // not in a session (e.g. partner already left): just search again
+      const last = socket.data.lastMatch;
+      if (last && allow(socket, 'match', 20, 60 * 1000)) await startMatching(socket, last.preference, last.mode);
+      return;
     }
+    endSession(roomId, 'next', userId);
+    const last = socket.data.lastMatch;
+    if (last && allow(socket, 'match', 20, 60 * 1000)) await startMatching(socket, last.preference, last.mode);
+  }));
+
+  socket.on('session:end', safe(({ roomId } = {}) => {
+    if (sessionFor(socket, roomId)) endSession(roomId, 'ended', userId);
+  }));
+
+  // Block = remembered for this account, so you are never matched again
+  socket.on('user:block', safe(async ({ roomId } = {}, ack) => {
+    const session = sessionFor(socket, roomId);
+    if (!session) return reply(ack, { ok: false });
+    const peer = peerOf(session, userId);
+    await User.updateOne({ _id: userId }, { $addToSet: { blockedUsers: peer.userId } });
+    endSession(roomId, 'blocked', userId);
+    reply(ack, { ok: true });
+  }));
+
+  socket.on('disconnect', () => {
+    if (state.userSocketMap.get(userId) === socket.id) state.userSocketMap.delete(userId);
+    state.waitingUsers = state.waitingUsers.filter((e) => e.socketId !== socket.id);
+    const roomId = state.userRoomMap.get(userId);
+    const session = roomId && state.activeSessions.get(roomId);
+    if (session && session.users.some((u) => u.userId === userId && u.socketId === socket.id)) {
+      endSession(roomId, 'disconnect', userId);
+    }
+    scheduleBroadcast();
   });
 });
 
+// ---------- admin sockets ----------
 adminIo.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
     if (!token) return next(new Error('Admin token missing.'));
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const admin = await User.findById(decoded.id);
-
-    if (!admin || admin.role !== 'admin' || admin.isDeleted || admin.isBanned) {
-      return next(new Error('Admin access denied.'));
-    }
-
+    const admin = await loadAdminFromToken(token);
     socket.adminId = admin._id.toString();
     socket.adminEmail = admin.email;
     next();
   } catch (error) {
-    next(new Error('Invalid admin token.'));
+    next(new Error('Admin access denied.'));
   }
 });
 
-adminIo.on('connection', async (socket) => {
-  const dashboard = await broadcastAdminStats();
-  socket.emit('dashboard:update', dashboard);
+adminIo.on('connection', safe(async (socket) => {
+  socket.emit('dashboard:update', await buildDashboard());
 
-  socket.on('moderation:join', ({ roomId }) => {
-    if (!roomId) return;
-    const session = state.activeSessions.get(roomId);
-    if (!session) {
-      return socket.emit('moderation:session', { roomId, messages: [], users: [] });
-    }
-    socket.join(roomId);
+  // Opening a live chat is always written to the audit log.
+  socket.on('moderation:join', safe(async ({ roomId } = {}) => {
+    const session = typeof roomId === 'string' && state.activeSessions.get(roomId);
+    if (!session) return socket.emit('moderation:session', { roomId, messages: [], users: [] });
+    await addAuditLog(socket.adminId, socket.adminEmail, 'moderate_session',
+      `Opened live chat of ${session.users.map((u) => u.name).join(' & ')} (${roomId}).`);
+    socket.join(`mod:${roomId}`);
     socket.emit('moderation:session', {
       roomId,
       messages: session.messages,
-      users: session.users,
+      users: session.users.map((u) => ({ userId: u.userId, name: u.name })),
     });
-  });
+  }));
+  socket.on('moderation:leave', ({ roomId } = {}) => { if (typeof roomId === 'string') socket.leave(`mod:${roomId}`); });
+  socket.on('sessions:request', () => scheduleBroadcast());
+}));
 
-  socket.on('sessions:request', async () => {
-    await broadcastAdminStats();
-  });
-});
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection', e));
 
 const PORT = Number(process.env.PORT) || 5000;
-
 mongoose
   .connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/randomchat')
   .then(async () => {
     console.log('MongoDB connected');
     await ensureAdminUser();
-    server.listen(PORT, () => {
-      console.log(`Backend listening on port ${PORT}`);
-    });
+    server.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
   })
   .catch((error) => {
     console.error('MongoDB connection failed:', error);

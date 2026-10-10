@@ -121,3 +121,52 @@ This service provides temporary, live, peer-to-peer sessions. No chat content, v
 - MongoDB is used only for user accounts and reports.
 - Chat content is never written to the database.
 - Admin accounts are separate from regular users and require dedicated credentials.
+
+---
+
+## Update notes (security + features)
+
+**Nothing in `render.yaml` or any `package.json` changed**, so `npm ci` and your Render Blueprint keep working. Push to GitHub and Render redeploys on its own.
+
+### What changed
+- Chat is memory-only and is erased from the server AND the screen the moment a session ends (Next / Stop / partner leaves / admin ends / disconnect).
+- User app: chat window with **Full screen** and **Mini screen** (floating window). In full screen the controls (Mute, Camera, **Next**, **Stop**, Report, Block) are always on screen.
+- Only the two people inside a session can send chat or WebRTC signals or end it (before, any logged-in user could).
+- **Next** now really finds a new person; Block is saved to the account and respected by matching.
+- Reports: only the person you are chatting with, reason picker, optional "attach last messages" checkbox, 5 reports/hour.
+- Admin: separate token secret, no default password in production, ban/unban/suspend/delete (real delete), password **reset link** (1 hour), live moderation updates, report resolve/dismiss, every admin view/action in the audit log.
+- Rate limits on signup/login/admin login/API, match requests, chat messages; input validation; `trust proxy` for Render.
+
+### Environment variables (Render dashboard -> backend -> Environment)
+Already set by the blueprint: `MONGODB_URI`, `JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ALLOWED_ORIGINS`.
+Optional (nothing breaks if you skip them):
+| Variable | Use |
+|---|---|
+| `ADMIN_JWT_SECRET` | separate secret for admin tokens (otherwise derived from `JWT_SECRET`) |
+| `CLIENT_URL` | user-app URL used in password reset links (default: first `ALLOWED_ORIGINS` entry) |
+| `STUN_URLS`, `TURN_URLS`, `TURN_SECRET` | time-limited TURN credentials served from `/api/ice` |
+
+First admin login: email = `ADMIN_EMAIL`, password = the `ADMIN_PASSWORD` value shown in the Render dashboard. If an admin already exists in the DB it is not touched.
+Old admin sessions stop working after this update: just log in again.
+
+### TURN server (coturn) - needed for users behind strict NAT
+```
+# /etc/turnserver.conf
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+use-auth-secret
+static-auth-secret=<same value as TURN_SECRET>
+realm=turn.yourdomain.com
+total-quota=100
+no-multicast-peers
+no-cli
+cert=/etc/letsencrypt/live/turn.yourdomain.com/fullchain.pem
+pkey=/etc/letsencrypt/live/turn.yourdomain.com/privkey.pem
+```
+Open ports 3478 (UDP/TCP), 5349 (TCP) and 49152-65535 (UDP). Then on the backend set
+`TURN_URLS=turn:turn.yourdomain.com:3478?transport=udp,turns:turn.yourdomain.com:5349?transport=tcp` and `TURN_SECRET`.
+(The older static `VITE_TURN_*` variables still work as a fallback.)
+
+### Free Render note
+The free backend sleeps when idle; the first request after a pause can take about 30-60 s. Live chat state is in memory, so a restart ends all running sessions (by design).

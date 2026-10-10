@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const userSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true, trim: true },
+    name: { type: String, required: true, trim: true, maxlength: 40 },
     email: {
       type: String,
       required: true,
@@ -21,7 +21,10 @@ const userSchema = new mongoose.Schema(
     },
     isBanned: { type: Boolean, default: false },
     isDeleted: { type: Boolean, default: false },
+    suspendedUntil: { type: Date, default: null },
     blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    resetTokenHash: { type: String, default: null },
+    resetExpires: { type: Date, default: null },
     lastLogin: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now },
   },
