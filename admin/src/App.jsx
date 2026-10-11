@@ -28,6 +28,11 @@ export default function App() {
   const [moderationMessages, setModerationMessages] = useState([]);
   const [modEnded, setModEnded] = useState(false);
   const [resetLink, setResetLink] = useState('');
+  const [admins, setAdmins] = useState([]);
+  const [newAdmin, setNewAdmin] = useState({ name: '', email: '', password: '' });
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pw, setPw] = useState({ current: '', next: '', confirm: '' });
+  const [pwMsg, setPwMsg] = useState('');
   const [now, setNow] = useState(Date.now());
   const socketRef = useRef(null);
   const tokenRef = useRef(token);
@@ -80,6 +85,28 @@ export default function App() {
   const fetchUsers = async () => {
     try { setUsers((await call(`/api/admin/users?search=${encodeURIComponent(search)}`)).users || []); } catch (e) { /* handled */ }
   };
+  const fetchAdmins = async () => { try { setAdmins((await call('/api/admin/admins')).admins || []); } catch (e) { /* handled */ } };
+  const addAdmin = async (event) => {
+    event.preventDefault();
+    try {
+      const data = await call('/api/admin/admins', 'POST', newAdmin);
+      setStatus(data.message);
+      setNewAdmin({ name: '', email: '', password: '' });
+      fetchAdmins(); fetchDashboard();
+    } catch (e) { if (e.message !== 'unauthorized') setStatus(e.message); }
+  };
+  const changeOwnPassword = async (event) => {
+    event.preventDefault();
+    if (pw.next !== pw.confirm) { setPwMsg('The new passwords do not match.'); return; }
+    try {
+      const data = await call('/api/admin/change-password', 'POST', { currentPassword: pw.current, newPassword: pw.next });
+      localStorage.setItem(TOKEN_KEY, data.token);
+      setToken(data.token);
+      setPwOpen(false); setPw({ current: '', next: '', confirm: '' }); setPwMsg('');
+      setStatus('Password changed. Other devices were logged out.');
+    } catch (e) { if (e.message !== 'unauthorized') setPwMsg(e.message); }
+  };
+
   const act = async (path, confirmText, onDone) => {
     if (confirmText && !window.confirm(confirmText)) return;
     try {
@@ -120,6 +147,7 @@ export default function App() {
         connectAdminSocket(token);
         fetchDashboard();
         fetchUsers();
+        fetchAdmins();
       } catch (e) { /* logout handled in call() */ }
     })();
   }, [token]);
@@ -165,6 +193,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3">
             <span className="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-300" role="status">{status}</span>
+            <button className="bg-slate-700 text-slate-100 hover:bg-slate-600" onClick={() => { setPwMsg(''); setPwOpen(true); }}>Change my password</button>
             <button className="bg-slate-700 text-slate-100 hover:bg-slate-600" onClick={() => logout()}>Logout</button>
           </div>
         </header>
@@ -290,6 +319,43 @@ export default function App() {
             ) : <p className="text-slate-400">Open a live session with "Moderate". Every time you do, it is written to the audit log.</p>}
           </div>
         </section>
+
+        <section className="rounded-2xl border border-slate-700 bg-slate-900 p-5">
+          <h2 className="mb-4 text-xl font-semibold">Admins</h2>
+          <div className="grid gap-6 lg:grid-cols-2">
+            <div className="space-y-2">
+              {admins.map((a) => (
+                <div key={a._id} className="rounded-xl border border-slate-700 bg-slate-950 p-3 text-sm">
+                  <p className="font-medium">{a.name} <span className="text-slate-400">{a.email}</span></p>
+                  <p className="text-xs text-slate-500">created {fmtTime(a.createdAt)} • last login {fmtTime(a.lastLogin)}</p>
+                </div>
+              ))}
+            </div>
+            <form onSubmit={addAdmin} className="space-y-3">
+              <p className="text-sm text-slate-300">Add a new admin</p>
+              <input placeholder="Name" maxLength={40} value={newAdmin.name} onChange={(e) => setNewAdmin({ ...newAdmin, name: e.target.value })} />
+              <input type="email" required placeholder="Email" value={newAdmin.email} onChange={(e) => setNewAdmin({ ...newAdmin, email: e.target.value })} />
+              <input type="password" required minLength={10} autoComplete="new-password" placeholder="Password (10+ characters)" value={newAdmin.password} onChange={(e) => setNewAdmin({ ...newAdmin, password: e.target.value })} />
+              <button type="submit" className="bg-cyan-500 text-slate-950 hover:bg-cyan-400">Create admin</button>
+            </form>
+          </div>
+        </section>
+
+        {pwOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+            <form onSubmit={changeOwnPassword} className="w-full max-w-sm space-y-3 rounded-2xl border border-slate-700 bg-slate-900 p-5">
+              <h3 className="text-lg font-semibold">Change my password</h3>
+              <input type="password" required placeholder="Current password" autoComplete="current-password" value={pw.current} onChange={(e) => setPw({ ...pw, current: e.target.value })} />
+              <input type="password" required minLength={10} placeholder="New password (10+ characters)" autoComplete="new-password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} />
+              <input type="password" required minLength={10} placeholder="Repeat new password" autoComplete="new-password" value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} />
+              {pwMsg && <p className="text-sm text-rose-300" role="alert">{pwMsg}</p>}
+              <div className="flex justify-end gap-2">
+                <button type="button" className="bg-slate-700 hover:bg-slate-600" onClick={() => setPwOpen(false)}>Cancel</button>
+                <button type="submit" className="bg-cyan-500 text-slate-950 hover:bg-cyan-400">Save</button>
+              </div>
+            </form>
+          </div>
+        )}
 
         <section className="rounded-2xl border border-slate-700 bg-slate-900 p-5">
           <h2 className="mb-4 text-xl font-semibold">Audit log</h2>

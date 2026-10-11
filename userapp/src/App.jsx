@@ -46,6 +46,9 @@ export default function App() {
   const [reportReason, setReportReason] = useState(REPORT_REASONS[0]);
   const [reportAttach, setReportAttach] = useState(false);
   const [legalOpen, setLegalOpen] = useState(false);
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pw, setPw] = useState({ current: '', next: '', confirm: '' });
+  const [pwMsg, setPwMsg] = useState('');
   const [resetToken, setResetToken] = useState(() => new URLSearchParams(window.location.search).get('reset') || '');
 
   const socketRef = useRef(null);
@@ -325,6 +328,28 @@ export default function App() {
     }
   };
 
+  const submitPasswordChange = async (event) => {
+    event.preventDefault();
+    if (pw.next !== pw.confirm) { setPwMsg('The new passwords do not match.'); return; }
+    try {
+      const response = await fetch(`${API_URL}/api/auth/change-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ currentPassword: pw.current, newPassword: pw.next }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Could not change password.');
+      localStorage.setItem(TOKEN_KEY, data.token);
+      setToken(data.token);
+      setPwOpen(false);
+      setPw({ current: '', next: '', confirm: '' });
+      setPwMsg('');
+      setStatus('Password changed. Other devices were logged out.');
+    } catch (error) {
+      setPwMsg(error.message);
+    }
+  };
+
   const handleResetSubmit = async (event) => {
     event.preventDefault();
     try {
@@ -591,6 +616,8 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3">
             <span className="rounded-full bg-emerald-500/15 px-3 py-1 text-xs text-emerald-300" role="status">{status}</span>
+            <button className="bg-slate-700 text-slate-100 hover:bg-slate-600" disabled={!!activeRoom}
+              title={activeRoom ? 'Finish your chat first' : ''} onClick={() => { setPwMsg(''); setPwOpen(true); }}>Change password</button>
             <button className="bg-slate-700 text-slate-100 hover:bg-slate-600" onClick={() => logout()}>Logout</button>
           </div>
         </header>
@@ -625,6 +652,22 @@ export default function App() {
           </p>
         </section>
       </div>
+      {pwOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4">
+          <form onSubmit={submitPasswordChange} className="w-full max-w-sm space-y-3 rounded-2xl border border-slate-700 bg-slate-900 p-5">
+            <h3 className="text-lg font-semibold">Change password</h3>
+            <input type="password" placeholder="Current password" required autoComplete="current-password" value={pw.current} onChange={(e) => setPw({ ...pw, current: e.target.value })} />
+            <input type="password" placeholder="New password (8+ characters)" required minLength={8} autoComplete="new-password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} />
+            <input type="password" placeholder="Repeat new password" required minLength={8} autoComplete="new-password" value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} />
+            {pwMsg && <p className="text-sm text-rose-300" role="alert">{pwMsg}</p>}
+            <p className="text-xs text-slate-400">You will stay logged in here; all your other devices are logged out.</p>
+            <div className="flex justify-end gap-2">
+              <button type="button" className="bg-slate-700 hover:bg-slate-600" onClick={() => setPwOpen(false)}>Cancel</button>
+              <button type="submit" className="bg-cyan-500 text-slate-950 hover:bg-cyan-400">Save</button>
+            </div>
+          </form>
+        </div>
+      )}
       {chatWindow}
       {reportModal}
       {legalModal}

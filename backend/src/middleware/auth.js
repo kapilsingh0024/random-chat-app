@@ -21,12 +21,17 @@ function accountProblem(user) {
   return null;
 }
 
+// A token issued before the last password change is no longer valid (logs out other devices).
+const issuedBeforePasswordChange = (decoded, user) =>
+  !!user.passwordChangedAt && decoded.iat < Math.floor(user.passwordChangedAt.getTime() / 1000);
+
 async function loadUserFromToken(token) {
   const decoded = jwt.verify(token, userSecret());
   if (decoded.role !== 'user') throw new Error('Wrong token type');
   const user = await User.findById(decoded.id);
   const problem = accountProblem(user);
   if (problem) throw new Error(problem);
+  if (issuedBeforePasswordChange(decoded, user)) throw new Error('Password was changed. Log in again.');
   return user;
 }
 
@@ -35,6 +40,7 @@ async function loadAdminFromToken(token) {
   if (decoded.role !== 'admin') throw new Error('Wrong token type');
   const user = await User.findById(decoded.id);
   if (accountProblem(user) || user.role !== 'admin') throw new Error('Admin access denied');
+  if (issuedBeforePasswordChange(decoded, user)) throw new Error('Password was changed. Log in again.');
   return user;
 }
 

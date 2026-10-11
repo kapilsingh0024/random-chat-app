@@ -170,3 +170,8 @@ Open ports 3478 (UDP/TCP), 5349 (TCP) and 49152-65535 (UDP). Then on the backend
 
 ### Free Render note
 The free backend sleeps when idle; the first request after a pause can take about 30-60 s. Live chat state is in memory, so a restart ends all running sessions (by design).
+
+### Passwords and admins
+- Users: **Change password** button on the home screen (needs the current password; other devices are logged out).
+- Admins: **Change my password** in the header, and an **Admins** section to add new admins (10+ character password). Every admin action is in the audit log.
+- Forgot your admin password? Another admin can't reset it from the panel; delete the admin document in MongoDB Atlas and redeploy (it is recreated from `ADMIN_EMAIL` / `ADMIN_PASSWORD`).

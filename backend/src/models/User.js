@@ -23,6 +23,7 @@ const userSchema = new mongoose.Schema(
     isDeleted: { type: Boolean, default: false },
     suspendedUntil: { type: Date, default: null },
     blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    passwordChangedAt: { type: Date, default: null },
     resetTokenHash: { type: String, default: null },
     resetExpires: { type: Date, default: null },
     lastLogin: { type: Date, default: null },

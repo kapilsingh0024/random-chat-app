@@ -273,6 +273,13 @@ const reportLimiter = rateLimit({
   keyGenerator: (req) => req.user.id,
   message: { message: 'Report limit reached. Try again later.' },
 });
+const passwordLimiter = rateLimit({
+  ...limiterOpts,
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyGenerator: (req) => (req.user || req.admin).id,
+  message: { message: 'Too many password attempts. Try again later.' },
+});
 app.use('/api', apiLimiter);
 
 async function ensureAdminUser() {
@@ -360,6 +367,7 @@ app.post('/api/auth/reset', authRateLimiter, async (req, res) => {
     const user = token && await User.findOne({ resetTokenHash: sha(token), resetExpires: { $gt: new Date() } });
     if (!user) return res.status(400).json({ message: 'Reset link is invalid or expired.' });
     user.passwordHash = await bcrypt.hash(password, 12);
+    user.passwordChangedAt = new Date();
     user.resetTokenHash = null;
     user.resetExpires = null;
     await user.save();
@@ -367,6 +375,35 @@ app.post('/api/auth/reset', authRateLimiter, async (req, res) => {
   } catch (error) {
     console.error('Reset error', error);
     res.status(500).json({ message: 'Unable to reset password.' });
+  }
+});
+
+// Shared by users and admins. Returns an error message, or null when the password was changed.
+async function changePassword(user, body) {
+  const current = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const next = typeof body.newPassword === 'string' ? body.newPassword : '';
+  const min = user.role === 'admin' ? 10 : 8;
+  if (next.length < min || next.length > 100) return `New password must be ${min}-100 characters.`;
+  if (!(await bcrypt.compare(current, user.passwordHash))) return 'Current password is wrong.';
+  if (current === next) return 'New password must be different from the current one.';
+  user.passwordHash = await bcrypt.hash(next, 12);
+  user.passwordChangedAt = new Date(); // logs out every other device
+  user.resetTokenHash = null;
+  user.resetExpires = null;
+  await user.save();
+  return null;
+}
+
+app.post('/api/auth/change-password', authMiddleware, passwordLimiter, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    const error = user && await changePassword(user, req.body);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    if (error) return res.status(400).json({ message: error });
+    res.json({ message: 'Password changed.', token: createToken(user) });
+  } catch (e) {
+    console.error('Change password error', e);
+    res.status(500).json({ message: 'Unable to change password.' });
   }
 });
 
@@ -434,6 +471,8 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
     if (!user || accountProblem(user) || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: 'Invalid admin credentials.' });
     }
+    user.lastLogin = new Date();
+    await user.save();
     await addAuditLog(user._id, user.email, 'admin_login');
     res.json({ user: sanitizeUser(user), token: createAdminToken(user) });
   } catch (error) {
@@ -466,6 +505,35 @@ async function targetUser(req, res) {
 }
 
 app.get('/api/admin/me', (req, res) => res.json({ user: req.admin }));
+
+app.post('/api/admin/change-password', passwordLimiter, wrap('Unable to change password.', async (req, res) => {
+  const user = await User.findById(req.admin.id);
+  const error = await changePassword(user, req.body);
+  if (error) return res.status(400).json({ message: error });
+  await audit(req, 'change_own_password');
+  res.json({ message: 'Password changed.', token: createAdminToken(user) });
+}));
+
+app.get('/api/admin/admins', wrap('Unable to load admins.', async (req, res) => {
+  auditView(req.admin, 'view_admins');
+  const admins = await User.find({ role: 'admin', isDeleted: false }).select('name email createdAt lastLogin').sort({ createdAt: 1 }).lean();
+  res.json({ admins });
+}));
+
+app.post('/api/admin/admins', wrap('Unable to create admin.', async (req, res) => {
+  const email = str(req.body.email, 120).toLowerCase();
+  const name = str(req.body.name, 40) || 'Admin';
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ message: 'Enter a valid email.' });
+  if (password.length < 10 || password.length > 100) return res.status(400).json({ message: 'Admin password must be 10-100 characters.' });
+  if (await User.exists({ email })) return res.status(409).json({ message: 'An account with this email already exists.' });
+  await User.create({
+    name, email, gender: 'female', ageConfirmed: true, role: 'admin', matchPreference: 'anyone',
+    passwordHash: await bcrypt.hash(password, 12),
+  });
+  await audit(req, 'create_admin', `New admin created: ${email}`);
+  res.status(201).json({ message: `Admin ${email} created. Share the password with them safely.` });
+}));
 
 app.get('/api/admin/dashboard', wrap('Unable to load admin dashboard.', async (req, res) => {
   auditView(req.admin, 'view_dashboard');
